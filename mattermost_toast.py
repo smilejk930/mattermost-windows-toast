@@ -45,10 +45,6 @@ class Config:
     token: str
     verify_ssl: bool = True
 
-    # WebSocket Origin 정책
-    #   None  -> Origin 헤더를 보내지 않음 (권장, Mattermost 호환성 최상)
-    #   "auto" 또는 "" -> server_url 을 Origin 으로 사용
-    #   임의 URL -> 해당 값을 Origin 헤더로 사용
     websocket_origin: str | None = None
 
     notify_dm: bool = True
@@ -166,6 +162,15 @@ class MattermostREST:
         r.raise_for_status()
         return r.json()
 
+    def my_teams(self) -> list[dict]:
+        try:
+            r = self.session.get(f"{self.base}/users/me/teams", timeout=10)
+            r.raise_for_status()
+            return r.json() or []
+        except Exception as e:
+            self.logger.warning("내 팀 조회 실패: %s", e)
+            return []
+
     def user(self, user_id: str) -> dict:
         if user_id in self._user_cache:
             return self._user_cache[user_id]
@@ -253,34 +258,68 @@ def open_deeplink(url: str, mode: str, logger: logging.Logger) -> None:
         logger.warning("링크 열기 실패 (%s): %s", url, e)
 
 
-def build_app_deeplink(server_url: str, team_name: str, channel_name: str, post_id: str | None = None) -> str:
-    host = urlparse(server_url).netloc or urlparse(server_url).path
-    team = team_name or "team"
-    if post_id:
-        return f"mattermost://{host}/{team}/pl/{post_id}"
-    return f"mattermost://{host}/{team}/channels/{channel_name or 'town-square'}"
-
-
-def build_web_link(server_url: str, team_name: str, channel_name: str, post_id: str | None = None) -> str:
-    base = server_url.rstrip("/")
-    team = team_name or "team"
-    if post_id:
-        return f"{base}/{team}/pl/{post_id}"
-    return f"{base}/{team}/channels/{quote(channel_name or 'town-square')}"
-
-
 # ---------------------------------------------------------------------------
-# 이벤트 처리
+# Deeplink 빌더
+#
+# Mattermost URL 형식:
+#   채널 :  /<team>/channels/<channel_name>
+#   DM   :  /<team>/messages/@<other_username>
+#   그룹DM:  /<team>/messages/<channel_name>
+#   permalink: /<team>/pl/<post_id>
+#
+# DM/그룹DM 채널은 어느 팀에도 소속되지 않으므로 team_id 가 비어 있다.
+# 이 경우 사용자가 소속된 아무 팀(보통 첫 번째)을 placeholder 로 사용한다.
 # ---------------------------------------------------------------------------
 
 CHANNEL_TYPE_DM = "D"
 CHANNEL_TYPE_GROUP = "G"
 
 
+def _host(server_url: str) -> str:
+    u = urlparse(server_url)
+    return u.netloc or u.path
+
+
+def build_link(
+    server_url: str,
+    scheme: str,  # "mattermost" 또는 "https"/"http"
+    team_name: str,
+    channel: dict,
+    sender_username: str,
+    post_id: str | None = None,
+) -> str:
+    host = _host(server_url)
+    team = team_name or "team"
+    ch_type = channel.get("type", "O")
+    ch_name = channel.get("name", "")
+
+    if scheme == "mattermost":
+        prefix = f"mattermost://{host}/{team}"
+    else:
+        prefix = f"{server_url.rstrip('/')}/{team}"
+
+    if ch_type == CHANNEL_TYPE_DM:
+        # DM: 상대방 username 으로 link
+        return f"{prefix}/messages/@{sender_username}"
+    if ch_type == CHANNEL_TYPE_GROUP:
+        # 그룹 DM: channel name(해시) 사용
+        return f"{prefix}/messages/{quote(ch_name)}"
+
+    # 일반 채널
+    if post_id:
+        return f"{prefix}/pl/{post_id}"
+    return f"{prefix}/channels/{quote(ch_name or 'town-square')}"
+
+
+# ---------------------------------------------------------------------------
+# 이벤트 처리
+# ---------------------------------------------------------------------------
+
 @dataclass
 class MeContext:
     user_id: str
     username: str
+    default_team_name: str = ""  # DM/그룹DM URL 의 placeholder 용
 
 
 class EventHandler:
@@ -379,7 +418,12 @@ class EventHandler:
 
             should, label = self._classify(post, channel, mentions)
             if not should:
-                self.logger.debug("skip post id=%s ch=%s type=%s", post.get("id"), channel.get("name"), channel.get("type"))
+                self.logger.debug(
+                    "skip post id=%s ch=%s type=%s",
+                    post.get("id"),
+                    channel.get("name"),
+                    channel.get("type"),
+                )
                 return
 
             sender_user = self.rest.user(post.get("user_id", ""))
@@ -387,14 +431,21 @@ class EventHandler:
 
             title, body = self._format(post, channel, sender_username, label)
 
+            # ---- 클릭 시 이동할 URL ----
+            ch_type = channel.get("type", "O")
             team_id = channel.get("team_id") or data.get("team_id") or ""
-            team = self.rest.team(team_id)
-            team_name = team.get("name") or ""
+
+            if ch_type in (CHANNEL_TYPE_DM, CHANNEL_TYPE_GROUP):
+                # DM/그룹DM 은 팀이 없으므로 사용자가 속한 첫 번째 팀을 placeholder
+                team_name = self.me.default_team_name or ""
+            else:
+                team = self.rest.team(team_id)
+                team_name = team.get("name") or self.me.default_team_name or ""
 
             if self.cfg.click_mode == "open_browser":
-                url = build_web_link(self.cfg.server_url, team_name, channel.get("name", ""), post.get("id"))
+                url = build_link(self.cfg.server_url, "https", team_name, channel, sender_username, post.get("id"))
             elif self.cfg.click_mode == "open_app":
-                url = build_app_deeplink(self.cfg.server_url, team_name, channel.get("name", ""), post.get("id"))
+                url = build_link(self.cfg.server_url, "mattermost", team_name, channel, sender_username, post.get("id"))
             else:
                 url = ""
 
@@ -405,7 +456,7 @@ class EventHandler:
                 open_deeplink(_url, _mode, _log)
 
             self.notifier.show(title, body, _on_click if url else None)
-            self.logger.info("notify [%s] %s :: %s", label, title, body[:80])
+            self.logger.info("notify [%s] %s :: %s -> %s", label, title, body[:60], url)
 
         except Exception as e:
             self.logger.exception("posted 이벤트 처리 중 오류: %s", e)
@@ -550,7 +601,18 @@ def main() -> int:
         logger.error("서버 접속 실패: %s", e)
         return 3
 
-    me = MeContext(user_id=me_data["id"], username=me_data.get("username", ""))
+    # DM URL placeholder 용으로 사용자 소속 팀 중 첫 번째를 받아둔다
+    teams = rest.my_teams()
+    default_team_name = ""
+    if teams:
+        default_team_name = teams[0].get("name", "")
+        logger.info("기본 팀(DM URL 용): %s", default_team_name)
+
+    me = MeContext(
+        user_id=me_data["id"],
+        username=me_data.get("username", ""),
+        default_team_name=default_team_name,
+    )
     logger.info("로그인: @%s (id=%s)", me.username, me.user_id)
 
     notifier = Notifier(logger)
