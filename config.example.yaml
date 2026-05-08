@@ -46,4 +46,14 @@ notifications:
   # 시스템 메시지(채널 입장/퇴장 등) 무시
   ignore_system_messages: true
 
-# 토스트 클�
+# 토스트 클릭 시 동작
+click_action:
+  # open_app: Mattermost 데스크톱 앱 실행 (mattermost:// 프로토콜)
+  # open_browser: 기본 브라우저로 채널 열기
+  # none: 동작 없음
+  mode: "open_app"
+
+# 로그 출력
+logging:
+  level: "INFO"   # DEBUG / INFO / WARNING / ERROR
+  file: "mattermost_toast.log"
