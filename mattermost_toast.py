@@ -4,13 +4,6 @@ Mattermost Windows Toast Notifier
 
 Mattermost(Free Edition 포함) 의 WebSocket API 로부터 실시간 이벤트를 수신하여
 Windows 10/11 의 네이티브 토스트(Action Center) 알림을 띄우는 프로그램.
-
-요구사항:
-    pip install -r requirements.txt
-
-사용법:
-    1) config.example.yaml 을 config.yaml 로 복사한 뒤 값 입력
-    2) python mattermost_toast.py
 """
 
 from __future__ import annotations
@@ -20,7 +13,6 @@ import logging
 import os
 import re
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -44,7 +36,7 @@ from windows_toasts import (
 # ---------------------------------------------------------------------------
 
 CONFIG_FILE_CANDIDATES = ["config.yaml", "config.yml"]
-APP_AUMID = "MattermostWindowsToast"  # Action Center 에 표시될 앱 ID
+APP_AUMID = "MattermostWindowsToast"
 
 
 @dataclass
@@ -52,6 +44,12 @@ class Config:
     server_url: str
     token: str
     verify_ssl: bool = True
+
+    # WebSocket Origin 정책
+    #   None  -> Origin 헤더를 보내지 않음 (권장, Mattermost 호환성 최상)
+    #   "auto" 또는 "" -> server_url 을 Origin 으로 사용
+    #   임의 URL -> 해당 값을 Origin 헤더로 사용
+    websocket_origin: str | None = None
 
     notify_dm: bool = True
     notify_mention: bool = True
@@ -83,10 +81,17 @@ class Config:
         if not token or "여기에" in token:
             raise ValueError("config.yaml: server.token (PAT) 이 설정되지 않았습니다.")
 
+        ws_origin_raw = srv.get("websocket_origin", None)
+        if ws_origin_raw in ("auto", ""):
+            ws_origin = url
+        else:
+            ws_origin = ws_origin_raw
+
         return cls(
             server_url=url,
             token=token,
             verify_ssl=bool(srv.get("verify_ssl", True)),
+            websocket_origin=ws_origin,
             notify_dm=bool(notif.get("dm", True)),
             notify_mention=bool(notif.get("mention", True)),
             notify_all_channels=bool(notif.get("all_channel_messages", True)),
@@ -110,10 +115,6 @@ def find_config_path() -> str:
         "config.yaml 을 찾을 수 없습니다. config.example.yaml 을 복사해서 만들어주세요."
     )
 
-
-# ---------------------------------------------------------------------------
-# 로깅
-# ---------------------------------------------------------------------------
 
 def setup_logging(level: str, log_file: str) -> logging.Logger:
     logger = logging.getLogger("mm-toast")
@@ -140,7 +141,7 @@ def setup_logging(level: str, log_file: str) -> logging.Logger:
 
 
 # ---------------------------------------------------------------------------
-# Mattermost REST 클라이언트 (인증 검증 + 메타데이터 캐시)
+# Mattermost REST 클라이언트
 # ---------------------------------------------------------------------------
 
 class MattermostREST:
@@ -156,7 +157,6 @@ class MattermostREST:
         self.session.verify = verify_ssl
         self.logger = logger
 
-        # 캐시
         self._user_cache: dict[str, dict] = {}
         self._channel_cache: dict[str, dict] = {}
         self._team_cache: dict[str, dict] = {}
@@ -173,7 +173,7 @@ class MattermostREST:
             r = self.session.get(f"{self.base}/users/{user_id}", timeout=10)
             r.raise_for_status()
             data = r.json()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             self.logger.warning("사용자 조회 실패 (%s): %s", user_id, e)
             data = {"id": user_id, "username": "unknown"}
         self._user_cache[user_id] = data
@@ -186,7 +186,7 @@ class MattermostREST:
             r = self.session.get(f"{self.base}/channels/{channel_id}", timeout=10)
             r.raise_for_status()
             data = r.json()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             self.logger.warning("채널 조회 실패 (%s): %s", channel_id, e)
             data = {"id": channel_id, "name": "", "display_name": "", "type": "O", "team_id": ""}
         self._channel_cache[channel_id] = data
@@ -201,7 +201,7 @@ class MattermostREST:
             r = self.session.get(f"{self.base}/teams/{team_id}", timeout=10)
             r.raise_for_status()
             data = r.json()
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             self.logger.warning("팀 조회 실패 (%s): %s", team_id, e)
             data = {"id": team_id, "name": "", "display_name": ""}
         self._team_cache[team_id] = data
@@ -215,18 +215,10 @@ class MattermostREST:
 class Notifier:
     def __init__(self, logger: logging.Logger):
         self.logger = logger
-        # AUMID 를 지정하면 Action Center 에 'MattermostWindowsToast' 라는 이름으로 그룹화됨
         self.toaster = WindowsToaster(APP_AUMID)
-        # 토스트 객체 GC 로 사라지면 클릭 콜백이 동작하지 않을 수 있어
-        # 참조를 유지해둔다.
         self._refs: list[Toast] = []
 
-    def show(
-        self,
-        title: str,
-        body: str,
-        on_click: Callable[[], None] | None = None,
-    ) -> None:
+    def show(self, title: str, body: str, on_click: Callable[[], None] | None = None) -> None:
         toast = Toast()
         toast.text_fields = [title, body]
         toast.duration = ToastDuration.Short
@@ -235,46 +227,33 @@ class Notifier:
             def _activated(_event_args, _cb=on_click):
                 try:
                     _cb()
-                except Exception as e:  # noqa: BLE001
+                except Exception as e:
                     self.logger.warning("토스트 클릭 처리 실패: %s", e)
 
             toast.on_activated = _activated
 
         try:
             self.toaster.show_toast(toast)
-            # 가장 최근 50개만 참조 유지
             self._refs.append(toast)
             if len(self._refs) > 50:
                 self._refs.pop(0)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             self.logger.error("토스트 표시 실패: %s", e)
 
 
 def open_deeplink(url: str, mode: str, logger: logging.Logger) -> None:
-    """클릭 시 채널/대화로 이동.
-
-    - open_app: mattermost:// 프로토콜 핸들러 (Mattermost 데스크톱 앱이 처리)
-    - open_browser: 기본 브라우저
-    - none: 무시
-    """
     if mode == "none" or not url:
         return
     try:
         if mode == "open_app":
-            # mattermost://... 형식의 URL
             os.startfile(url)  # type: ignore[attr-defined]
         else:
             webbrowser.open(url)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.warning("링크 열기 실패 (%s): %s", url, e)
 
 
 def build_app_deeplink(server_url: str, team_name: str, channel_name: str, post_id: str | None = None) -> str:
-    """Mattermost 데스크톱 앱이 인식하는 deeplink 형식.
-
-    예) mattermost://server.example.com/myteam/channels/town-square
-        mattermost://server.example.com/myteam/pl/POST_ID
-    """
     host = urlparse(server_url).netloc or urlparse(server_url).path
     team = team_name or "team"
     if post_id:
@@ -305,71 +284,52 @@ class MeContext:
 
 
 class EventHandler:
-    def __init__(
-        self,
-        cfg: Config,
-        rest: MattermostREST,
-        notifier: Notifier,
-        me: MeContext,
-        logger: logging.Logger,
-    ):
+    def __init__(self, cfg: Config, rest: MattermostREST, notifier: Notifier, me: MeContext, logger: logging.Logger):
         self.cfg = cfg
         self.rest = rest
         self.notifier = notifier
         self.me = me
         self.logger = logger
 
-        # 키워드 정규식 (대소문자 무시, 부분 일치)
         if cfg.keywords:
             pattern = "|".join(re.escape(k) for k in cfg.keywords)
             self.kw_re: re.Pattern[str] | None = re.compile(pattern, re.IGNORECASE)
         else:
             self.kw_re = None
 
-    # ---- 메시지 분류 ----
     def _classify(self, post: dict, channel: dict, mentions: list[str]) -> tuple[bool, str]:
-        """알림을 띄울지 여부와 분류 라벨을 반환."""
         ch_type = channel.get("type", "O")
 
-        # 본인 메시지 무시
         if self.cfg.ignore_own_messages and post.get("user_id") == self.me.user_id:
             return False, ""
 
-        # 시스템 메시지 무시 (post.type 이 비어있지 않으면 system 계열)
         if self.cfg.ignore_system_messages and post.get("type"):
             return False, ""
 
-        # 1) DM
         if ch_type == CHANNEL_TYPE_DM:
             if self.cfg.notify_dm:
                 return True, "DM"
             return False, ""
 
-        # 2) Group DM
         if ch_type == CHANNEL_TYPE_GROUP:
             if self.cfg.notify_dm:
                 return True, "Group"
-            # 그룹 DM 도 멘션이면 띄움
             if self.cfg.notify_mention and self.me.user_id in mentions:
                 return True, "Mention"
             return False, ""
 
-        # 3) 멘션
         if self.cfg.notify_mention and self.me.user_id in mentions:
             return True, "Mention"
 
-        # 4) 키워드
         msg = post.get("message", "") or ""
         if self.kw_re is not None and self.kw_re.search(msg):
             return True, "Keyword"
 
-        # 5) 모든 채널
         if self.cfg.notify_all_channels:
             return True, "Channel"
 
         return False, ""
 
-    # ---- 토스트 본문 구성 ----
     def _format(self, post: dict, channel: dict, sender_username: str, label: str) -> tuple[str, str]:
         ch_type = channel.get("type", "O")
         ch_display = channel.get("display_name") or channel.get("name") or ""
@@ -385,7 +345,6 @@ class EventHandler:
 
         body = (post.get("message") or "").strip()
         if not body:
-            # 첨부파일/링크만 있을 수도 있음
             if post.get("file_ids"):
                 body = "(파일 첨부)"
             else:
@@ -396,7 +355,6 @@ class EventHandler:
 
         return title, body
 
-    # ---- 진입점 ----
     def handle_posted(self, data: dict) -> None:
         try:
             post_raw = data.get("post")
@@ -412,7 +370,6 @@ class EventHandler:
 
             channel_id = post.get("channel_id") or ""
             channel = self.rest.channel(channel_id) if channel_id else {}
-            # 채널 표시 이름이 broadcast 에 들어있을 때도 있음
             if not channel.get("display_name") and data.get("channel_display_name"):
                 channel["display_name"] = data["channel_display_name"]
             if not channel.get("name") and data.get("channel_name"):
@@ -422,12 +379,7 @@ class EventHandler:
 
             should, label = self._classify(post, channel, mentions)
             if not should:
-                self.logger.debug(
-                    "skip post id=%s ch=%s type=%s",
-                    post.get("id"),
-                    channel.get("name"),
-                    channel.get("type"),
-                )
+                self.logger.debug("skip post id=%s ch=%s type=%s", post.get("id"), channel.get("name"), channel.get("type"))
                 return
 
             sender_user = self.rest.user(post.get("user_id", ""))
@@ -435,7 +387,6 @@ class EventHandler:
 
             title, body = self._format(post, channel, sender_username, label)
 
-            # 클릭 시 이동할 URL 구성
             team_id = channel.get("team_id") or data.get("team_id") or ""
             team = self.rest.team(team_id)
             team_name = team.get("name") or ""
@@ -456,21 +407,16 @@ class EventHandler:
             self.notifier.show(title, body, _on_click if url else None)
             self.logger.info("notify [%s] %s :: %s", label, title, body[:80])
 
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             self.logger.exception("posted 이벤트 처리 중 오류: %s", e)
 
 
 # ---------------------------------------------------------------------------
-# WebSocket 루프 (자동 재연결)
+# WebSocket 루프
 # ---------------------------------------------------------------------------
 
 class WebSocketLoop:
-    def __init__(
-        self,
-        cfg: Config,
-        handler: EventHandler,
-        logger: logging.Logger,
-    ):
+    def __init__(self, cfg: Config, handler: EventHandler, logger: logging.Logger):
         self.cfg = cfg
         self.handler = handler
         self.logger = logger
@@ -483,7 +429,7 @@ class WebSocketLoop:
         try:
             if self._ws is not None:
                 self._ws.close()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
     def _ws_url(self) -> str:
@@ -529,13 +475,13 @@ class WebSocketLoop:
     def run_forever(self) -> None:
         backoff = 1
         url = self._ws_url()
-        # Mattermost 는 WebSocket 업그레이드 시 Origin 헤더를 CORS 검사에 사용함.
-        # 기본값(websocket-client 가 ws:// 스킴으로 자동 생성하는 Origin)은
-        # 거절되므로, 서버 URL 과 동일한 http(s):// Origin 을 명시적으로 보낸다.
-        origin = self.cfg.server_url.rstrip("/")
-        self.logger.info("WebSocket 대상: %s (Origin=%s)", url, origin)
+        origin = self.cfg.websocket_origin
+        if origin is None:
+            self.logger.info("WebSocket 대상: %s (Origin 헤더 미전송)", url)
+        else:
+            self.logger.info("WebSocket 대상: %s (Origin=%s)", url, origin)
 
-        sslopt = None if self.cfg.verify_ssl else {"cert_reqs": 0}  # ssl.CERT_NONE = 0
+        sslopt = None if self.cfg.verify_ssl else {"cert_reqs": 0}
 
         while not self._stop.is_set():
             try:
@@ -546,13 +492,17 @@ class WebSocketLoop:
                     on_error=self._on_error,
                     on_close=self._on_close,
                 )
-                self._ws.run_forever(
-                    ping_interval=30,
-                    ping_timeout=10,
-                    sslopt=sslopt,
-                    origin=origin,
-                )
-            except Exception as e:  # noqa: BLE001
+                run_kwargs: dict[str, Any] = {
+                    "ping_interval": 30,
+                    "ping_timeout": 10,
+                    "sslopt": sslopt,
+                }
+                if origin is None:
+                    run_kwargs["suppress_origin"] = True
+                else:
+                    run_kwargs["origin"] = origin
+                self._ws.run_forever(**run_kwargs)
+            except Exception as e:
                 self.logger.warning("WS 루프 예외: %s", e)
 
             if self._stop.is_set():
@@ -579,7 +529,7 @@ def main() -> int:
 
     try:
         cfg = Config.load(cfg_path)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         print(f"설정 파일 로드 실패: {e}", file=sys.stderr)
         return 2
 
@@ -590,13 +540,13 @@ def main() -> int:
 
     rest = MattermostREST(cfg.server_url, cfg.token, cfg.verify_ssl, logger)
 
-    # PAT 검증
     try:
         me_data = rest.me()
     except requests.HTTPError as e:
-        logger.error("인증 실패 (HTTP %s). PAT 가 유효한지 확인하세요.", e.response.status_code if e.response else "?")
+        logger.error("인증 실패 (HTTP %s). PAT 가 유효한지 확인하세요.",
+                     e.response.status_code if e.response else "?")
         return 3
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.error("서버 접속 실패: %s", e)
         return 3
 
@@ -607,12 +557,26 @@ def main() -> int:
     handler = EventHandler(cfg, rest, notifier, me, logger)
     loop = WebSocketLoop(cfg, handler, logger)
 
-    # 시작 알림
     notifier.show("Mattermost Toast", f"@{me.username} 으로 알림 수신을 시작합니다.")
 
-    # Ctrl+C 우아하게 종료
     def _sigint(_signum, _frame):
         logger.info("종료 신호 수신, 정리 중...")
         loop.stop()
 
-    
+    try:
+        signal.signal(signal.SIGINT, _sigint)
+        signal.signal(signal.SIGTERM, _sigint)
+    except (ValueError, AttributeError):
+        pass
+
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        loop.stop()
+
+    logger.info("종료")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
