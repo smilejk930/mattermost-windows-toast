@@ -1,0 +1,53 @@
+# =============================================================================
+# Mattermost Windows Toast - 설정 파일
+# 이 파일을 config.yaml 로 복사한 뒤 값을 채워 넣으세요.
+# =============================================================================
+
+server:
+  # Mattermost 서버 주소 (https:// 또는 http://)
+  url: "https://mattermost.example.com"
+
+  # 개인 액세스 토큰 (Personal Access Token)
+  # 발급 방법: 프로필 사진 > 계정 설정 > 보안 > 개인 액세스 토큰
+  # (관리자가 "Enable Personal Access Tokens"를 활성화해야 합니다)
+  token: "여기에-PAT-입력"
+
+  # SSL 인증서 검증 (사내 인증서가 신뢰되지 않을 때만 false)
+  verify_ssl: true
+
+notifications:
+  # DM(1:1 다이렉트 메시지)
+  dm: true
+
+  # @내가 멘션된 메시지 (@username, @channel, @here, @all)
+  mention: true
+
+  # 내가 속한 모든 채널의 새 메시지
+  # 카카오톡처럼 모든 메시지를 받고 싶으면 true
+  all_channel_messages: true
+
+  # 키워드 알림 (대소문자 무시, 부분 일치)
+  keywords:
+    - "긴급"
+    - "urgent"
+
+  # 자기 자신이 보낸 메시지는 알림 제외
+  ignore_own_messages: true
+
+  # 알림에 본문을 몇 자까지 노출할지
+  body_max_length: 200
+
+  # 시스템 메시지(채널 입장/퇴장 등) 무시
+  ignore_system_messages: true
+
+# 토스트 클릭 시 동작
+click_action:
+  # open_app: Mattermost 데스크톱 앱 실행 (mattermost:// 프로토콜)
+  # open_browser: 기본 브라우저로 채널 열기
+  # none: 동작 없음
+  mode: "open_app"
+
+# 로그 출력
+logging:
+  level: "INFO"   # DEBUG / INFO / WARNING / ERROR
+  file: "mattermost_toast.log"

@@ -1,0 +1,9 @@
+config.yaml
+*.log
+__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+dist/
+*.spec
