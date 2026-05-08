@@ -15,6 +15,12 @@ server:
   # SSL 인증서 검증 (사내 인증서가 신뢰되지 않을 때만 false)
   verify_ssl: true
 
+  # WebSocket Origin 헤더 정책
+  #   생략/null  -> Origin 헤더를 보내지 않음 (Mattermost 기본 호환, 권장)
+  #   "auto"     -> server.url 을 Origin 으로 사용
+  #   특정 URL   -> 관리자가 AllowCorsFrom 에 등록한 값과 일치시켜야 할 때 지정
+  # websocket_origin: null
+
 notifications:
   # DM(1:1 다이렉트 메시지)
   dm: true
@@ -40,14 +46,4 @@ notifications:
   # 시스템 메시지(채널 입장/퇴장 등) 무시
   ignore_system_messages: true
 
-# 토스트 클릭 시 동작
-click_action:
-  # open_app: Mattermost 데스크톱 앱 실행 (mattermost:// 프로토콜)
-  # open_browser: 기본 브라우저로 채널 열기
-  # none: 동작 없음
-  mode: "open_app"
-
-# 로그 출력
-logging:
-  level: "INFO"   # DEBUG / INFO / WARNING / ERROR
-  file: "mattermost_toast.log"
+# 토스트 클�
