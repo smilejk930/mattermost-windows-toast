@@ -1,14 +1,14 @@
 @echo off
 REM ===========================================================
-REM Mattermost Windows Toast 실행 스크립트
+REM Mattermost Windows Toast launcher
 REM ===========================================================
 cd /d "%~dp0"
 
-REM 가상환경이 있으면 활성화
-if exist ".venv\Scripts\activate.bat" (
-    call ".venv\Scripts\activate.bat"
+REM Activate venv if it exists
+if exist ".venv\Scriptsctivate.bat" (
+    call ".venv\Scriptsctivate.bat"
 )
 
-REM 콘솔 창 없이 실행하고 싶다면 pythonw.exe 로 변경
+REM To run without a console window, replace 'python' with 'pythonw'
 python mattermost_toast.py
 pause
