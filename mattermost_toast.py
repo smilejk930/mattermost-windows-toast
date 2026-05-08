@@ -249,24 +249,110 @@ class MattermostREST:
 # ---------------------------------------------------------------------------
 
 class Notifier:
+    """Windows Toast 알림 표시기.
+
+    - ``group_key`` 가 주어지면 동일 키의 활성 알림을 누적 카운트와 함께 갱신한다.
+      (예: 같은 사람으로부터 DM 이 연달아 올 때 새 토스트를 쌓지 않고 하나의 토스트를
+      "[N건] 최신 메시지" 형태로 갱신)
+    - ``group_key`` 가 None 이면 매번 독립된 토스트를 띄운다(기존 동작).
+    """
+
+    # 같은 group 내에서 누적이 유지되는 시간(초). 이 시간이 지나면 새 알림으로 시작.
+    GROUP_TTL_SECONDS = 60 * 60  # 1시간
+
     def __init__(self, logger: logging.Logger):
         self.logger = logger
         self.toaster = WindowsToaster(APP_AUMID)
         self._refs: list[Toast] = []
+        self._lock = threading.Lock()
+        # group_key -> {"tag", "group", "count", "ts"}
+        self._groups: dict[str, dict[str, Any]] = {}
 
-    def show(self, title: str, body: str, on_click: Callable[[], None] | None = None) -> None:
+    @staticmethod
+    def _safe_id(value: str) -> str:
+        # 토스트 tag/group 은 문자열이면 되지만 안전하게 영숫자/-/_ 만 남긴다.
+        cleaned = re.sub(r"[^A-Za-z0-9_-]", "", value or "")
+        if not cleaned:
+            cleaned = "x"
+        # Windows 10+ 64자 한도. 여유있게 자른다.
+        return cleaned[:48]
+
+    def show(
+        self,
+        title: str,
+        body: str,
+        on_click: Callable[[], None] | None = None,
+        group_key: str | None = None,
+    ) -> None:
+        if group_key is None:
+            self._show(title, body, on_click=on_click, tag=None, group=None, group_key=None)
+            return
+
+        now = time.time()
+        with self._lock:
+            existing = self._groups.get(group_key)
+            if existing is None or (now - existing.get("ts", 0)) > self.GROUP_TTL_SECONDS:
+                count = 1
+                tag = "mmdm-" + self._safe_id(group_key)
+                group = "mmdm"
+                self._groups[group_key] = {
+                    "tag": tag,
+                    "group": group,
+                    "count": count,
+                    "ts": now,
+                }
+            else:
+                count = int(existing.get("count", 0)) + 1
+                existing["count"] = count
+                existing["ts"] = now
+                tag = existing["tag"]
+                group = existing["group"]
+
+        if count >= 2:
+            shown_body = "[새 메시지 " + str(count) + "건] " + body
+        else:
+            shown_body = body
+
+        self._show(title, shown_body, on_click=on_click, tag=tag, group=group, group_key=group_key)
+
+    def _show(
+        self,
+        title: str,
+        body: str,
+        on_click: Callable[[], None] | None,
+        tag: str | None,
+        group: str | None,
+        group_key: str | None,
+    ) -> None:
         toast = Toast()
         toast.text_fields = [title, body]
         toast.duration = ToastDuration.Short
+        if tag is not None:
+            toast.tag = tag
+        if group is not None:
+            toast.group = group
 
-        if on_click is not None:
-            def _activated(_event_args, _cb=on_click):
-                try:
-                    _cb()
-                except Exception as e:
-                    self.logger.warning("토스트 클릭 처리 실패: %s", e)
+        # 클릭 / 닫힘 시 해당 group 의 누적 카운트를 리셋한다.
+        # (다음 메시지부터 다시 1건 부터 시작)
+        gk = group_key
+
+        if on_click is not None or gk is not None:
+            def _activated(_event_args, _cb=on_click, _gk=gk):
+                if _cb is not None:
+                    try:
+                        _cb()
+                    except Exception as e:
+                        self.logger.warning("토스트 클릭 처리 실패: %s", e)
+                if _gk is not None:
+                    self._reset_group(_gk)
 
             toast.on_activated = _activated
+
+        if gk is not None:
+            def _dismissed(_event_args, _gk=gk):
+                self._reset_group(_gk)
+
+            toast.on_dismissed = _dismissed
 
         try:
             self.toaster.show_toast(toast)
@@ -275,6 +361,10 @@ class Notifier:
                 self._refs.pop(0)
         except Exception as e:
             self.logger.error("토스트 표시 실패: %s", e)
+
+    def _reset_group(self, group_key: str) -> None:
+        with self._lock:
+            self._groups.pop(group_key, None)
 
 
 def open_deeplink(url: str, mode: str, logger: logging.Logger) -> None:
@@ -467,8 +557,24 @@ class EventHandler:
             def _on_click(_url=url, _mode=cb_mode, _log=cb_logger):
                 open_deeplink(_url, _mode, _log)
 
-            self.notifier.show(title, body, _on_click if url else None)
-            self.logger.info("notify [%s] %s :: %s -> %s", label, title, body[:60], url)
+            # DM / 그룹DM 은 같은 채널의 연속 알림을 하나로 묶어서 카운트로 표시한다.
+            # 일반 채널/멘션/키워드는 기존대로 매번 독립된 토스트.
+            if ch_type in (CHANNEL_TYPE_DM, CHANNEL_TYPE_GROUP) and channel_id:
+                group_key = "ch:" + channel_id
+            else:
+                group_key = None
+
+            self.notifier.show(
+                title,
+                body,
+                _on_click if url else None,
+                group_key=group_key,
+            )
+            self.logger.info(
+                "notify [%s] %s :: %s -> %s%s",
+                label, title, body[:60], url,
+                (" (group=" + group_key + ")") if group_key else "",
+            )
 
         except Exception as e:
             self.logger.exception("posted 이벤트 처리 중 오류: %s", e)
