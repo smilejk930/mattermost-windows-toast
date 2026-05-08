@@ -37,6 +37,37 @@ from windows_toasts import (
 
 CONFIG_FILE_CANDIDATES = ["config.yaml", "config.yml"]
 APP_AUMID = "MattermostWindowsToast"
+APP_DISPLAY_NAME = "Mattermost Toast"  # Action Center 토스트 헤더에 표시될 이름
+
+
+def register_aumid(aumid: str, display_name: str, logger: logging.Logger | None = None) -> bool:
+    """Windows AUMID 에 DisplayName 을 등록한다.
+
+    이 작업을 하지 않으면 Action Center 토스트 헤더에 부모 프로세스의 AUMID
+    (예: 'PythonSoftwareFoundation.Python.3.13_...')가 그대로 노출된다.
+
+    HKEY_CURRENT_USER 에 쓰므로 관리자 권한이나 외부 라이브러리 없이
+    표준 라이브러리 winreg 만으로 동작한다.
+    """
+    try:
+        import winreg  # type: ignore[import-not-found]
+    except ImportError:
+        if logger:
+            logger.debug("winreg unavailable - non-Windows, skip AUMID 등록")
+        return False
+
+    key_path = r"SOFTWARE\Classes\AppUserModelId\{}".format(aumid)
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, display_name)
+            winreg.SetValueEx(key, "ShowInActionCenter", 0, winreg.REG_DWORD, 1)
+        if logger:
+            logger.info("AUMID 등록 완료: %s -> '%s'", aumid, display_name)
+        return True
+    except OSError as e:
+        if logger:
+            logger.warning("AUMID 등록 실패 (%s): %s", aumid, e)
+        return False
 
 
 @dataclass
@@ -55,7 +86,7 @@ class Config:
     body_max_length: int = 200
     ignore_system_messages: bool = True
 
-    click_mode: str = "open_app"  # open_app | open_browser | none
+    click_mode: str = "open_app"
 
     log_level: str = "INFO"
     log_file: str = "mattermost_toast.log"
@@ -146,7 +177,7 @@ class MattermostREST:
         self.session = requests.Session()
         self.session.headers.update(
             {
-                "Authorization": f"Bearer {token}",
+                "Authorization": "Bearer " + token,
                 "Accept": "application/json",
             }
         )
@@ -158,13 +189,13 @@ class MattermostREST:
         self._team_cache: dict[str, dict] = {}
 
     def me(self) -> dict:
-        r = self.session.get(f"{self.base}/users/me", timeout=10)
+        r = self.session.get(self.base + "/users/me", timeout=10)
         r.raise_for_status()
         return r.json()
 
     def my_teams(self) -> list[dict]:
         try:
-            r = self.session.get(f"{self.base}/users/me/teams", timeout=10)
+            r = self.session.get(self.base + "/users/me/teams", timeout=10)
             r.raise_for_status()
             return r.json() or []
         except Exception as e:
@@ -175,7 +206,7 @@ class MattermostREST:
         if user_id in self._user_cache:
             return self._user_cache[user_id]
         try:
-            r = self.session.get(f"{self.base}/users/{user_id}", timeout=10)
+            r = self.session.get(self.base + "/users/" + user_id, timeout=10)
             r.raise_for_status()
             data = r.json()
         except Exception as e:
@@ -188,7 +219,7 @@ class MattermostREST:
         if channel_id in self._channel_cache:
             return self._channel_cache[channel_id]
         try:
-            r = self.session.get(f"{self.base}/channels/{channel_id}", timeout=10)
+            r = self.session.get(self.base + "/channels/" + channel_id, timeout=10)
             r.raise_for_status()
             data = r.json()
         except Exception as e:
@@ -203,7 +234,7 @@ class MattermostREST:
         if team_id in self._team_cache:
             return self._team_cache[team_id]
         try:
-            r = self.session.get(f"{self.base}/teams/{team_id}", timeout=10)
+            r = self.session.get(self.base + "/teams/" + team_id, timeout=10)
             r.raise_for_status()
             data = r.json()
         except Exception as e:
@@ -260,15 +291,6 @@ def open_deeplink(url: str, mode: str, logger: logging.Logger) -> None:
 
 # ---------------------------------------------------------------------------
 # Deeplink 빌더
-#
-# Mattermost URL 형식:
-#   채널 :  /<team>/channels/<channel_name>
-#   DM   :  /<team>/messages/@<other_username>
-#   그룹DM:  /<team>/messages/<channel_name>
-#   permalink: /<team>/pl/<post_id>
-#
-# DM/그룹DM 채널은 어느 팀에도 소속되지 않으므로 team_id 가 비어 있다.
-# 이 경우 사용자가 소속된 아무 팀(보통 첫 번째)을 placeholder 로 사용한다.
 # ---------------------------------------------------------------------------
 
 CHANNEL_TYPE_DM = "D"
@@ -282,7 +304,7 @@ def _host(server_url: str) -> str:
 
 def build_link(
     server_url: str,
-    scheme: str,  # "mattermost" 또는 "https"/"http"
+    scheme: str,
     team_name: str,
     channel: dict,
     sender_username: str,
@@ -294,21 +316,18 @@ def build_link(
     ch_name = channel.get("name", "")
 
     if scheme == "mattermost":
-        prefix = f"mattermost://{host}/{team}"
+        prefix = "mattermost://" + host + "/" + team
     else:
-        prefix = f"{server_url.rstrip('/')}/{team}"
+        prefix = server_url.rstrip("/") + "/" + team
 
     if ch_type == CHANNEL_TYPE_DM:
-        # DM: 상대방 username 으로 link
-        return f"{prefix}/messages/@{sender_username}"
+        return prefix + "/messages/@" + sender_username
     if ch_type == CHANNEL_TYPE_GROUP:
-        # 그룹 DM: channel name(해시) 사용
-        return f"{prefix}/messages/{quote(ch_name)}"
+        return prefix + "/messages/" + quote(ch_name)
 
-    # 일반 채널
     if post_id:
-        return f"{prefix}/pl/{post_id}"
-    return f"{prefix}/channels/{quote(ch_name or 'town-square')}"
+        return prefix + "/pl/" + post_id
+    return prefix + "/channels/" + quote(ch_name or "town-square")
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +338,7 @@ def build_link(
 class MeContext:
     user_id: str
     username: str
-    default_team_name: str = ""  # DM/그룹DM URL 의 placeholder 용
+    default_team_name: str = ""
 
 
 class EventHandler:
@@ -374,13 +393,13 @@ class EventHandler:
         ch_display = channel.get("display_name") or channel.get("name") or ""
 
         if ch_type == CHANNEL_TYPE_DM:
-            title = f"@{sender_username}"
+            title = "@" + sender_username
         elif ch_type == CHANNEL_TYPE_GROUP:
-            title = f"@{sender_username} · 그룹"
+            title = "@" + sender_username + " · 그룹"
         else:
             tag = "@멘션" if label == "Mention" else ("[키워드]" if label == "Keyword" else "")
-            prefix = f"{tag} " if tag else ""
-            title = f"{prefix}{ch_display} · @{sender_username}".strip()
+            prefix = (tag + " ") if tag else ""
+            title = (prefix + ch_display + " · @" + sender_username).strip()
 
         body = (post.get("message") or "").strip()
         if not body:
@@ -418,12 +437,7 @@ class EventHandler:
 
             should, label = self._classify(post, channel, mentions)
             if not should:
-                self.logger.debug(
-                    "skip post id=%s ch=%s type=%s",
-                    post.get("id"),
-                    channel.get("name"),
-                    channel.get("type"),
-                )
+                self.logger.debug("skip post id=%s ch=%s type=%s", post.get("id"), channel.get("name"), channel.get("type"))
                 return
 
             sender_user = self.rest.user(post.get("user_id", ""))
@@ -431,12 +445,10 @@ class EventHandler:
 
             title, body = self._format(post, channel, sender_username, label)
 
-            # ---- 클릭 시 이동할 URL ----
             ch_type = channel.get("type", "O")
             team_id = channel.get("team_id") or data.get("team_id") or ""
 
             if ch_type in (CHANNEL_TYPE_DM, CHANNEL_TYPE_GROUP):
-                # DM/그룹DM 은 팀이 없으므로 사용자가 속한 첫 번째 팀을 placeholder
                 team_name = self.me.default_team_name or ""
             else:
                 team = self.rest.team(team_id)
@@ -487,7 +499,7 @@ class WebSocketLoop:
         u = urlparse(self.cfg.server_url)
         scheme = "wss" if u.scheme == "https" else "ws"
         host = u.netloc or u.path
-        return f"{scheme}://{host}/api/v4/websocket"
+        return scheme + "://" + host + "/api/v4/websocket"
 
     def _on_open(self, ws: websocket.WebSocketApp) -> None:
         self.logger.info("WebSocket 연결됨, 인증 challenge 전송")
@@ -581,13 +593,16 @@ def main() -> int:
     try:
         cfg = Config.load(cfg_path)
     except Exception as e:
-        print(f"설정 파일 로드 실패: {e}", file=sys.stderr)
+        print("설정 파일 로드 실패: " + str(e), file=sys.stderr)
         return 2
 
     logger = setup_logging(cfg.log_level, cfg.log_file)
     logger.info("=" * 60)
     logger.info("Mattermost Windows Toast 시작")
     logger.info("server=%s click=%s", cfg.server_url, cfg.click_mode)
+
+    # AUMID DisplayName 등록 (실패해도 동작에는 지장 없음, 헤더 라벨만 못 바뀜)
+    register_aumid(APP_AUMID, APP_DISPLAY_NAME, logger)
 
     rest = MattermostREST(cfg.server_url, cfg.token, cfg.verify_ssl, logger)
 
@@ -601,7 +616,6 @@ def main() -> int:
         logger.error("서버 접속 실패: %s", e)
         return 3
 
-    # DM URL placeholder 용으로 사용자 소속 팀 중 첫 번째를 받아둔다
     teams = rest.my_teams()
     default_team_name = ""
     if teams:
@@ -619,7 +633,7 @@ def main() -> int:
     handler = EventHandler(cfg, rest, notifier, me, logger)
     loop = WebSocketLoop(cfg, handler, logger)
 
-    notifier.show("Mattermost Toast", f"@{me.username} 으로 알림 수신을 시작합니다.")
+    notifier.show("Mattermost Toast", "@" + me.username + " 으로 알림 수신을 시작합니다.")
 
     def _sigint(_signum, _frame):
         logger.info("종료 신호 수신, 정리 중...")
