@@ -529,7 +529,11 @@ class WebSocketLoop:
     def run_forever(self) -> None:
         backoff = 1
         url = self._ws_url()
-        self.logger.info("WebSocket 대상: %s", url)
+        # Mattermost 는 WebSocket 업그레이드 시 Origin 헤더를 CORS 검사에 사용함.
+        # 기본값(websocket-client 가 ws:// 스킴으로 자동 생성하는 Origin)은
+        # 거절되므로, 서버 URL 과 동일한 http(s):// Origin 을 명시적으로 보낸다.
+        origin = self.cfg.server_url.rstrip("/")
+        self.logger.info("WebSocket 대상: %s (Origin=%s)", url, origin)
 
         sslopt = None if self.cfg.verify_ssl else {"cert_reqs": 0}  # ssl.CERT_NONE = 0
 
@@ -546,6 +550,7 @@ class WebSocketLoop:
                     ping_interval=30,
                     ping_timeout=10,
                     sslopt=sslopt,
+                    origin=origin,
                 )
             except Exception as e:  # noqa: BLE001
                 self.logger.warning("WS 루프 예외: %s", e)
@@ -610,21 +615,4 @@ def main() -> int:
         logger.info("종료 신호 수신, 정리 중...")
         loop.stop()
 
-    try:
-        signal.signal(signal.SIGINT, _sigint)
-        signal.signal(signal.SIGTERM, _sigint)
-    except (ValueError, AttributeError):
-        # Windows 비대화형 환경에서 실패할 수 있음
-        pass
-
-    try:
-        loop.run_forever()
-    except KeyboardInterrupt:
-        loop.stop()
-
-    logger.info("종료")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    
