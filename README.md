@@ -63,7 +63,7 @@ click_action:
 ## 실행
 
 ```powershell
-python mattermost_toast.py
+.venv\Scripts\python mattermost_toast.py
 ```
 
 또는 `run.bat` 더블클릭.
@@ -80,6 +80,7 @@ python mattermost_toast.py
 ## 단일 실행 파일 만들기 (선택)
 
 ```powershell
+.venv\Scripts\activate
 pip install pyinstaller
 pyinstaller --noconfirm --onefile --noconsole mattermost_toast.py
 ```
