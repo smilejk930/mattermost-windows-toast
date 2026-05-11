@@ -746,4 +746,114 @@ class WebSocketLoop:
 
 # ---------------------------------------------------------------------------
 # main
-# ---
+# ---------------------------------------------------------------------------
+
+def _run() -> int:
+    try:
+        cfg_path = find_config_path()
+    except FileNotFoundError as e:
+        show_error_message("Mattermost Toast - 설정 파일 없음", str(e))
+        return 2
+
+    try:
+        cfg = Config.load(cfg_path)
+    except Exception as e:
+        show_error_message(
+            "Mattermost Toast - 설정 파일 오류",
+            "config.yaml 을 읽지 못했습니다.\n\n경로: " + cfg_path + "\n\n원인: " + str(e),
+        )
+        return 2
+
+    logger = setup_logging(cfg.log_level, cfg.log_file)
+    logger.info("=" * 60)
+    logger.info("Mattermost Windows Toast 시작")
+    logger.info("server=%s click=%s", cfg.server_url, cfg.click_mode)
+
+    # AUMID DisplayName 등록 (실패해도 동작에는 지장 없음, 헤더 라벨만 못 바뀜)
+    register_aumid(APP_AUMID, APP_DISPLAY_NAME, logger)
+
+    rest = MattermostREST(cfg.server_url, cfg.token, cfg.verify_ssl, logger)
+
+    try:
+        me_data = rest.me()
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        logger.error("인증 실패 (HTTP %s). PAT 가 유효한지 확인하세요.", status)
+        show_error_message(
+            "Mattermost Toast - 인증 실패",
+            "Mattermost 인증에 실패했습니다 (HTTP " + str(status) + ").\n\n"
+            "config.yaml 의 server.token (PAT) 이 유효한지 확인하세요.",
+        )
+        return 3
+    except Exception as e:
+        logger.error("서버 접속 실패: %s", e)
+        show_error_message(
+            "Mattermost Toast - 서버 접속 실패",
+            "Mattermost 서버에 접속하지 못했습니다.\n\n"
+            "server.url: " + cfg.server_url + "\n\n원인: " + str(e),
+        )
+        return 3
+
+    teams = rest.my_teams()
+    default_team_name = ""
+    if teams:
+        default_team_name = teams[0].get("name", "")
+        logger.info("기본 팀(DM URL 용): %s", default_team_name)
+
+    me = MeContext(
+        user_id=me_data["id"],
+        username=me_data.get("username", ""),
+        default_team_name=default_team_name,
+    )
+    logger.info("로그인: @%s (id=%s)", me.username, me.user_id)
+
+    notifier = Notifier(logger)
+    handler = EventHandler(cfg, rest, notifier, me, logger)
+    loop = WebSocketLoop(cfg, handler, logger)
+
+    notifier.show("Mattermost Toast", "@" + me.username + " 으로 알림 수신을 시작합니다.")
+
+    def _sigint(_signum, _frame):
+        logger.info("종료 신호 수신, 정리 중...")
+        loop.stop()
+
+    try:
+        signal.signal(signal.SIGINT, _sigint)
+        signal.signal(signal.SIGTERM, _sigint)
+    except (ValueError, AttributeError):
+        pass
+
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        loop.stop()
+
+    logger.info("종료")
+    return 0
+
+
+def main() -> int:
+    """모든 예외를 잡아 로그 파일 + MessageBox 로 알린 뒤 종료한다.
+
+    --noconsole 로 빌드된 exe 에서는 처리되지 않은 예외가 그냥 사라져 버려서
+    사용자 입장에서는 "아무 일도 일어나지 않은" 것처럼 보인다. 이를 방지한다.
+    """
+    try:
+        return _run()
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        return 0
+    except Exception as e:
+        log_path = write_crash_log("uncaught", e)
+        show_error_message(
+            "Mattermost Toast - 예기치 못한 오류",
+            "프로그램이 비정상 종료되었습니다.\n\n"
+            + type(e).__name__ + ": " + str(e) + "\n\n"
+            + "자세한 내용은 다음 파일을 확인하세요:\n" + str(log_path),
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
