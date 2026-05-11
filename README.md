@@ -46,10 +46,23 @@ Python 설치나 의존성 설치는 필요 없습니다 (모두 exe 안에 포�
 오류가 발생하면 화면에 메시지 박스가 뜨고, 상세 내용은 exe 옆에 생성되는
 `mattermost_toast_error.log` (치명적 오류) / `mattermost_toast.log` (실행 로그) 에 기록됩니다.
 
-### Windows 시작 시 자동 실행
+### 통합 관리 도구 (mattermost_init.bat)
 
-`Win + R` → `shell:startup` → 열린 폴더에 `mattermost_toast.exe` 의 바로가기를
-넣어두면 로그인 시 자동 시작됩니다.
+`mattermost_init.bat` 을 `mattermost_toast.exe` 와 같은 폴더에 두고 더블클릭하면
+콘솔 메뉴로 다음 작업을 할 수 있습니다.
+
+1. 프로그램 시작
+2. 프로그램 종료 (`taskkill` 로 강제 종료)
+3. 프로그램 재시작
+4. **Windows 시작 시 자동 실행 등록** (현재 사용자의 `HKCU\...\Run` 레지스트리)
+5. 자동 실행 등록 해제
+
+> `mattermost_init.bat` 은 cmd 기본 코드페이지(한국어 Windows 의 949)에 맞춰
+> **ANSI(CP949)** 로 저장되어 있습니다. 메모장에서 수정해 다시 저장할 때는
+> 인코딩을 반드시 **ANSI** 로 두세요. UTF-8 로 저장하면 메뉴 한글이 깨집니다.
+
+자동 실행만 따로 걸고 싶다면 `Win + R` → `shell:startup` 폴더에
+`mattermost_toast.exe` 의 바로가기를 넣어두어도 됩니다.
 
 > 알림이 보이지 않는다면 **설정 → 시스템 → 알림** 에서 알림이 켜져 있는지,
 > **집중 모드(Focus Assist)** 가 꺼져 있는지 확인하세요.
@@ -118,6 +131,7 @@ mattermost-windows-toast/
 ├── config.yaml              # 실제 설정 (git ignored)
 ├── build.bat                # exe 빌드 스크립트 (개발자용)
 ├── run.bat                  # 소스에서 실행 (개발자용)
+├── mattermost_init.bat      # exe 시작/종료/자동 실행 등록 통합 관리 도구
 ├── .gitignore
 └── README.md
 ```
