@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 > nul
 REM ===========================================================
 REM Mattermost Windows Toast - one-shot build script
 REM ===========================================================
