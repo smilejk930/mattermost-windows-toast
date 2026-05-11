@@ -8,6 +8,7 @@ Windows 10/11 의 네이티브 토스트(Action Center) 알림을 띄우는 프�
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import logging
 import os
@@ -16,8 +17,10 @@ import signal
 import sys
 import threading
 import time
+import traceback
 import webbrowser
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, urlparse
 
@@ -38,6 +41,50 @@ from windows_toasts import (
 CONFIG_FILE_CANDIDATES = ["config.yaml", "config.yml"]
 APP_AUMID = "MattermostWindowsToast"
 APP_DISPLAY_NAME = "Mattermost Toast"  # Action Center 토스트 헤더에 표시될 이름
+
+
+def app_dir() -> Path:
+    """프로그램이 위치한 폴더.
+
+    - PyInstaller --onefile 로 빌드된 exe 일 때는 exe 파일이 있는 폴더.
+      (sys._MEIPASS / __file__ 은 임시 추출 폴더라서 config.yaml 위치로는 부적합)
+    - 일반 python 실행일 때는 스크립트 파일이 있는 폴더.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def show_error_message(title: str, message: str) -> None:
+    """Windows MessageBox 로 사용자에게 오류를 보여준다.
+
+    --noconsole 로 빌드된 exe 는 stderr 가 보이지 않으므로,
+    사용자가 알아야 할 치명적 오류는 이 함수로 표시한다.
+    """
+    try:
+        import ctypes  # type: ignore[import-not-found]
+        # MB_OK(0x00) | MB_ICONERROR(0x10) | MB_SETFOREGROUND(0x10000)
+        ctypes.windll.user32.MessageBoxW(None, message, title, 0x10 | 0x10000)
+        return
+    except Exception:
+        pass
+    try:
+        if sys.stderr is not None:
+            sys.stderr.write("[" + title + "] " + message + "\n")
+    except Exception:
+        pass
+
+
+def write_crash_log(prefix: str, exc: BaseException) -> Path:
+    """예외 트레이스를 app_dir 옆 로그 파일에 append 하고 경로를 돌려준다."""
+    log_path = app_dir() / "mattermost_toast_error.log"
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write("\n--- " + _dt.datetime.now().isoformat() + " " + prefix + " ---\n")
+            f.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+    except Exception:
+        pass
+    return log_path
 
 
 def register_aumid(aumid: str, display_name: str, logger: logging.Logger | None = None) -> bool:
@@ -133,13 +180,16 @@ class Config:
 
 
 def find_config_path() -> str:
-    here = os.path.dirname(os.path.abspath(__file__))
+    here = str(app_dir())
     for name in CONFIG_FILE_CANDIDATES:
         p = os.path.join(here, name)
         if os.path.isfile(p):
             return p
     raise FileNotFoundError(
-        "config.yaml 을 찾을 수 없습니다. config.example.yaml 을 복사해서 만들어주세요."
+        "config.yaml 을 찾을 수 없습니다.\n\n"
+        "위치: " + here + "\n"
+        "이 폴더에 config.yaml 을 만들어 주세요. "
+        "(config.example.yaml 을 복사해서 server.url / server.token 을 채우면 됩니다.)"
     )
 
 
@@ -153,12 +203,21 @@ def setup_logging(level: str, log_file: str) -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt)
-    logger.addHandler(sh)
+    # --noconsole 로 빌드된 exe 에서는 sys.stdout 이 None 일 수 있으므로 방어한다.
+    if sys.stdout is not None:
+        try:
+            sh = logging.StreamHandler(sys.stdout)
+            sh.setFormatter(fmt)
+            logger.addHandler(sh)
+        except Exception:
+            pass
 
+    # 로그 파일 경로가 상대 경로면 app_dir 기준으로 절대화한다.
+    log_path = Path(log_file)
+    if not log_path.is_absolute():
+        log_path = app_dir() / log_path
     try:
-        fh = logging.FileHandler(log_file, encoding="utf-8")
+        fh = logging.FileHandler(str(log_path), encoding="utf-8")
         fh.setFormatter(fmt)
         logger.addHandler(fh)
     except OSError:
@@ -687,78 +746,4 @@ class WebSocketLoop:
 
 # ---------------------------------------------------------------------------
 # main
-# ---------------------------------------------------------------------------
-
-def main() -> int:
-    try:
-        cfg_path = find_config_path()
-    except FileNotFoundError as e:
-        print(str(e), file=sys.stderr)
-        return 2
-
-    try:
-        cfg = Config.load(cfg_path)
-    except Exception as e:
-        print("설정 파일 로드 실패: " + str(e), file=sys.stderr)
-        return 2
-
-    logger = setup_logging(cfg.log_level, cfg.log_file)
-    logger.info("=" * 60)
-    logger.info("Mattermost Windows Toast 시작")
-    logger.info("server=%s click=%s", cfg.server_url, cfg.click_mode)
-
-    # AUMID DisplayName 등록 (실패해도 동작에는 지장 없음, 헤더 라벨만 못 바뀜)
-    register_aumid(APP_AUMID, APP_DISPLAY_NAME, logger)
-
-    rest = MattermostREST(cfg.server_url, cfg.token, cfg.verify_ssl, logger)
-
-    try:
-        me_data = rest.me()
-    except requests.HTTPError as e:
-        logger.error("인증 실패 (HTTP %s). PAT 가 유효한지 확인하세요.",
-                     e.response.status_code if e.response else "?")
-        return 3
-    except Exception as e:
-        logger.error("서버 접속 실패: %s", e)
-        return 3
-
-    teams = rest.my_teams()
-    default_team_name = ""
-    if teams:
-        default_team_name = teams[0].get("name", "")
-        logger.info("기본 팀(DM URL 용): %s", default_team_name)
-
-    me = MeContext(
-        user_id=me_data["id"],
-        username=me_data.get("username", ""),
-        default_team_name=default_team_name,
-    )
-    logger.info("로그인: @%s (id=%s)", me.username, me.user_id)
-
-    notifier = Notifier(logger)
-    handler = EventHandler(cfg, rest, notifier, me, logger)
-    loop = WebSocketLoop(cfg, handler, logger)
-
-    notifier.show("Mattermost Toast", "@" + me.username + " 으로 알림 수신을 시작합니다.")
-
-    def _sigint(_signum, _frame):
-        logger.info("종료 신호 수신, 정리 중...")
-        loop.stop()
-
-    try:
-        signal.signal(signal.SIGINT, _sigint)
-        signal.signal(signal.SIGTERM, _sigint)
-    except (ValueError, AttributeError):
-        pass
-
-    try:
-        loop.run_forever()
-    except KeyboardInterrupt:
-        loop.stop()
-
-    logger.info("종료")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+# ---
